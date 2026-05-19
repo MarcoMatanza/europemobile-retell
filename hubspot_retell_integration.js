@@ -335,6 +335,58 @@ app.post('/retell/set_opt_out', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// F11: transfer_to_human — Gespräch an Mensch übergeben
+// ═══════════════════════════════════════════════════════════
+app.post('/retell/transfer_to_human', async (req, res) => {
+  const { contact_id, reason, urgency } = req.body;
+  const transferNumber = process.env.INTERNAL_TRANSFER_NUMBER;
+
+  // Sicherheits-Check: Ist eine Transfer-Nummer überhaupt konfiguriert?
+  if (!transferNumber) {
+    console.log('[Transfer] FEHLER: Keine INTERNAL_TRANSFER_NUMBER in Env-Variables gesetzt.');
+    return res.json({
+      success: false,
+      transfer_possible: false,
+      message: 'Keine Transfer-Nummer konfiguriert. Bitte Rückruf-Task anlegen.',
+      fallback: 'create_task'
+    });
+  }
+
+  // Geschäftszeiten prüfen — außerhalb GZ kein Transfer, sondern Rückruf
+  const open = isBusinessHours();
+  if (!open) {
+    return res.json({
+      success: false,
+      transfer_possible: false,
+      message: 'Außerhalb der Geschäftszeiten. Bitte Rückruf für den nächsten Werktag vereinbaren.',
+      fallback: 'book_appointment'
+    });
+  }
+
+  // Transfer in HubSpot dokumentieren
+  if (contact_id) {
+    try {
+      await hs.patch(`/crm/v3/objects/contacts/${contact_id}`, { properties: {
+        em_ai_call_status: 'transferred',
+        em_ai_next_step: 'human_handoff',
+        em_ai_last_call_timestamp: new Date().toISOString(),
+      }});
+    } catch (e) {
+      console.log(`[Transfer] HubSpot-Update fehlgeschlagen: ${e.message}`);
+    }
+  }
+
+  console.log(`[Transfer] Contact ${contact_id||'unbekannt'} → ${transferNumber} | Grund: ${reason||'k.A.'} | Dringlichkeit: ${urgency||'normal'}`);
+
+  res.json({
+    success: true,
+    transfer_possible: true,
+    transfer_number: transferNumber,
+    message: 'Ich verbinde Sie jetzt mit einem Kollegen aus dem Team.'
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
 // POST-CALL WEBHOOK
 // ═══════════════════════════════════════════════════════════
 app.post('/retell/post-call-webhook', async (req, res) => {
@@ -342,7 +394,7 @@ app.post('/retell/post-call-webhook', async (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 10 }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11 }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Retell Integration läuft auf Port ${PORT}`));
