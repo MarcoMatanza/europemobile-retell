@@ -3,6 +3,7 @@
  * EUROPEMOBILE × RETELL AI — HUBSPOT CUSTOM FUNCTIONS
  * Deploy: Railway / Render / Vercel
  * Alle Endpoints: https://[deine-domain]/retell/[function-name]
+ * Version: v2 — Robuste Telefonnummer-Suche mit mehreren Format-Varianten
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -50,10 +51,115 @@ const CONFIG = {
 
 function normalizePhone(phone) {
   if (!phone) return '';
-  let n = phone.replace(/[\s\-\(\)\.]/g, '');
+  let n = String(phone).replace(/[\s\-\(\)\.]/g, '');
   if (n.startsWith('00')) n = '+' + n.slice(2);
   if (n.startsWith('0') && !n.startsWith('00')) n = '+49' + n.slice(1);
   return n;
+}
+
+/**
+ * Erzeugt verschiedene Telefonnummer-Formate für die HubSpot-Suche.
+ * HubSpot speichert Nummern oft mit Leerzeichen (z.B. "+49 179 2340447"),
+ * während Retell sie zusammengeschrieben liefert ("+491792340447").
+ * Wir probieren alle gängigen Varianten durch.
+ */
+function buildPhoneVariants(input) {
+  if (!input) return [];
+  const clean = String(input).replace(/[\s\-\(\)\.\/]/g, '');
+
+  // E.164-Normalform ohne Leerzeichen
+  let e164;
+  if (clean.startsWith('+'))         e164 = clean;
+  else if (clean.startsWith('00'))   e164 = '+' + clean.slice(2);
+  else if (clean.startsWith('0'))    e164 = '+49' + clean.slice(1);
+  else                                e164 = '+' + clean;
+
+  const digits = e164.slice(1); // nur Ziffern, ohne +
+  if (digits.length < 6) return [e164];
+
+  const variants = new Set();
+  variants.add(e164);                            // +491792340447
+  variants.add(digits);                          // 491792340447 (ohne +)
+  variants.add('0' + digits.slice(2));           // 01792340447 (deutsche Schreibweise)
+
+  // Varianten mit typischen Trennzeichen (für deutsche Nummern)
+  if (digits.startsWith('49') && digits.length >= 5) {
+    const cc   = digits.slice(0, 2);   // 49
+    const area = digits.slice(2, 5);   // 179
+    const rest = digits.slice(5);      // 2340447
+
+    variants.add(`+${cc} ${area} ${rest}`);   // +49 179 2340447  ← HubSpot-Default
+    variants.add(`+${cc} ${area}${rest}`);    // +49 1792340447
+    variants.add(`0${area} ${rest}`);         // 0179 2340447
+    variants.add(`+${cc}-${area}-${rest}`);   // +49-179-2340447
+    variants.add(`(0${area}) ${rest}`);       // (0179) 2340447
+  }
+
+  return [...variants];
+}
+
+async function robustContactLookup({ phone, email }) {
+  const variants = buildPhoneVariants(phone);
+  const props = ['firstname','lastname','email','phone','mobilephone',
+                 'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'];
+
+  // 1) Exakte Matches in allen Format-Varianten und beiden Telefonfeldern
+  for (const variant of variants) {
+    for (const field of ['phone', 'mobilephone']) {
+      try {
+        const r = await hs.post('/crm/v3/objects/contacts/search', {
+          filterGroups: [{ filters: [{ propertyName: field, operator: 'EQ', value: variant }] }],
+          properties: props,
+          limit: 1
+        });
+        if (r.data.results?.length > 0) {
+          console.log(`[lookup_contact] Match via ${field}="${variant}"`);
+          return r.data.results[0];
+        }
+      } catch (e) {
+        console.log(`[lookup_contact] Search error ${field}="${variant}": ${e.message}`);
+      }
+    }
+  }
+
+  // 2) Fuzzy-Fallback: Letzte 7 Ziffern (deutscher Nummern-Stamm)
+  if (phone) {
+    const digitsOnly = String(phone).replace(/[^0-9]/g, '');
+    if (digitsOnly.length >= 7) {
+      const lastSeven = digitsOnly.slice(-7);
+      for (const field of ['phone', 'mobilephone']) {
+        try {
+          const r = await hs.post('/crm/v3/objects/contacts/search', {
+            filterGroups: [{ filters: [{ propertyName: field, operator: 'CONTAINS_TOKEN', value: lastSeven }] }],
+            properties: props,
+            limit: 1
+          });
+          if (r.data.results?.length > 0) {
+            console.log(`[lookup_contact] Fuzzy match via ${field} CONTAINS "${lastSeven}"`);
+            return r.data.results[0];
+          }
+        } catch {}
+      }
+    }
+  }
+
+  // 3) Email als allerletzte Möglichkeit
+  if (email) {
+    try {
+      const r = await hs.post('/crm/v3/objects/contacts/search', {
+        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
+        properties: props,
+        limit: 1
+      });
+      if (r.data.results?.length > 0) {
+        console.log(`[lookup_contact] Match via email="${email}"`);
+        return r.data.results[0];
+      }
+    } catch {}
+  }
+
+  console.log(`[lookup_contact] No match for phone="${phone}" email="${email}"`);
+  return null;
 }
 
 function isBusinessHours() {
@@ -63,29 +169,6 @@ function isBusinessHours() {
   return CONFIG.BUSINESS_HOURS.days.includes(day) &&
     hour >= CONFIG.BUSINESS_HOURS.start &&
     hour < CONFIG.BUSINESS_HOURS.end;
-}
-
-async function robustContactLookup({ phone, email }) {
-  const phones = phone
-    ? [normalizePhone(phone), normalizePhone(phone).replace('+49','0')]
-    : [];
-  const searches = [
-    ...phones.map(p => ({ propertyName: 'phone', operator: 'EQ', value: p })),
-    ...phones.map(p => ({ propertyName: 'mobilephone', operator: 'EQ', value: p })),
-    ...(email ? [{ propertyName: 'email', operator: 'EQ', value: email }] : []),
-  ];
-  for (const filter of searches) {
-    try {
-      const r = await hs.post('/crm/v3/objects/contacts/search', {
-        filterGroups: [{ filters: [filter] }],
-        properties: ['firstname','lastname','email','phone','mobilephone',
-                     'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'],
-        limit: 1
-      });
-      if (r.data.results?.length > 0) return r.data.results[0];
-    } catch {}
-  }
-  return null;
 }
 
 async function getSalesOwner() {
@@ -341,7 +424,6 @@ app.post('/retell/transfer_to_human', async (req, res) => {
   const { contact_id, reason, urgency } = req.body;
   const transferNumber = process.env.INTERNAL_TRANSFER_NUMBER;
 
-  // Sicherheits-Check: Ist eine Transfer-Nummer überhaupt konfiguriert?
   if (!transferNumber) {
     console.log('[Transfer] FEHLER: Keine INTERNAL_TRANSFER_NUMBER in Env-Variables gesetzt.');
     return res.json({
@@ -352,7 +434,6 @@ app.post('/retell/transfer_to_human', async (req, res) => {
     });
   }
 
-  // Geschäftszeiten prüfen — außerhalb GZ kein Transfer, sondern Rückruf
   const open = isBusinessHours();
   if (!open) {
     return res.json({
@@ -363,7 +444,6 @@ app.post('/retell/transfer_to_human', async (req, res) => {
     });
   }
 
-  // Transfer in HubSpot dokumentieren
   if (contact_id) {
     try {
       await hs.patch(`/crm/v3/objects/contacts/${contact_id}`, { properties: {
@@ -394,7 +474,7 @@ app.post('/retell/post-call-webhook', async (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11 }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v2' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Retell Integration läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Retell Integration v2 läuft auf Port ${PORT}`));
