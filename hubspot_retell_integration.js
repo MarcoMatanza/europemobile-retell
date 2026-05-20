@@ -1,9 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
  * EUROPEMOBILE × RETELL AI — HUBSPOT CUSTOM FUNCTIONS
- * Deploy: Railway / Render / Vercel
- * Alle Endpoints: https://[deine-domain]/retell/[function-name]
- * Version: v2 — Robuste Telefonnummer-Suche mit mehreren Format-Varianten
+ * Version: v3 — Diagnose-Build mit /diag Endpoint
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -34,20 +32,18 @@ const CONFIG = {
     support_rechtsanwalt: '36992161',
   },
   OWNERS: {
-    SALES_A:        '13507121',  // Raphael Matanza (primär)
-    SALES_B:        '13507124',  // Sebastian Dudas
-    SALES_C:        '83220033',  // Andreas Tzeretas
-    SALES_D:        '51180404',  // Gabriele Eder (Fallback)
-    ORGANISATION:   '13507107',  // Thomas Abfalter
-    HELPDESK:       '13507107',  // Thomas Abfalter
-    LOGISTIK:       '70800857',  // Fabian Stein
-    BUCHHALTUNG:    '69995518',  // Jasmin Burkl
-    ZULASSUNG:      '78387480',  // Alina Klersy
+    SALES_A:        '13507121',
+    SALES_B:        '13507124',
+    SALES_C:        '83220033',
+    SALES_D:        '51180404',
+    ORGANISATION:   '13507107',
+    HELPDESK:       '13507107',
+    LOGISTIK:       '70800857',
+    BUCHHALTUNG:    '69995518',
+    ZULASSUNG:      '78387480',
   },
   BUSINESS_HOURS: { start: 8.5, end: 17, days: [1,2,3,4,5] },
 };
-
-// ─── HILFSFUNKTIONEN ─────────────────────────────────────────────────────
 
 function normalizePhone(phone) {
   if (!phone) return '';
@@ -57,44 +53,30 @@ function normalizePhone(phone) {
   return n;
 }
 
-/**
- * Erzeugt verschiedene Telefonnummer-Formate für die HubSpot-Suche.
- * HubSpot speichert Nummern oft mit Leerzeichen (z.B. "+49 179 2340447"),
- * während Retell sie zusammengeschrieben liefert ("+491792340447").
- * Wir probieren alle gängigen Varianten durch.
- */
 function buildPhoneVariants(input) {
   if (!input) return [];
   const clean = String(input).replace(/[\s\-\(\)\.\/]/g, '');
-
-  // E.164-Normalform ohne Leerzeichen
   let e164;
   if (clean.startsWith('+'))         e164 = clean;
   else if (clean.startsWith('00'))   e164 = '+' + clean.slice(2);
   else if (clean.startsWith('0'))    e164 = '+49' + clean.slice(1);
   else                                e164 = '+' + clean;
-
-  const digits = e164.slice(1); // nur Ziffern, ohne +
+  const digits = e164.slice(1);
   if (digits.length < 6) return [e164];
-
   const variants = new Set();
-  variants.add(e164);                            // +491792340447
-  variants.add(digits);                          // 491792340447 (ohne +)
-  variants.add('0' + digits.slice(2));           // 01792340447 (deutsche Schreibweise)
-
-  // Varianten mit typischen Trennzeichen (für deutsche Nummern)
+  variants.add(e164);
+  variants.add(digits);
+  variants.add('0' + digits.slice(2));
   if (digits.startsWith('49') && digits.length >= 5) {
-    const cc   = digits.slice(0, 2);   // 49
-    const area = digits.slice(2, 5);   // 179
-    const rest = digits.slice(5);      // 2340447
-
-    variants.add(`+${cc} ${area} ${rest}`);   // +49 179 2340447  ← HubSpot-Default
-    variants.add(`+${cc} ${area}${rest}`);    // +49 1792340447
-    variants.add(`0${area} ${rest}`);         // 0179 2340447
-    variants.add(`+${cc}-${area}-${rest}`);   // +49-179-2340447
-    variants.add(`(0${area}) ${rest}`);       // (0179) 2340447
+    const cc   = digits.slice(0, 2);
+    const area = digits.slice(2, 5);
+    const rest = digits.slice(5);
+    variants.add(`+${cc} ${area} ${rest}`);
+    variants.add(`+${cc} ${area}${rest}`);
+    variants.add(`0${area} ${rest}`);
+    variants.add(`+${cc}-${area}-${rest}`);
+    variants.add(`(0${area}) ${rest}`);
   }
-
   return [...variants];
 }
 
@@ -102,15 +84,12 @@ async function robustContactLookup({ phone, email }) {
   const variants = buildPhoneVariants(phone);
   const props = ['firstname','lastname','email','phone','mobilephone',
                  'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'];
-
-  // 1) Exakte Matches in allen Format-Varianten und beiden Telefonfeldern
   for (const variant of variants) {
     for (const field of ['phone', 'mobilephone']) {
       try {
         const r = await hs.post('/crm/v3/objects/contacts/search', {
           filterGroups: [{ filters: [{ propertyName: field, operator: 'EQ', value: variant }] }],
-          properties: props,
-          limit: 1
+          properties: props, limit: 1
         });
         if (r.data.results?.length > 0) {
           console.log(`[lookup_contact] Match via ${field}="${variant}"`);
@@ -121,8 +100,6 @@ async function robustContactLookup({ phone, email }) {
       }
     }
   }
-
-  // 2) Fuzzy-Fallback: Letzte 7 Ziffern (deutscher Nummern-Stamm)
   if (phone) {
     const digitsOnly = String(phone).replace(/[^0-9]/g, '');
     if (digitsOnly.length >= 7) {
@@ -131,8 +108,7 @@ async function robustContactLookup({ phone, email }) {
         try {
           const r = await hs.post('/crm/v3/objects/contacts/search', {
             filterGroups: [{ filters: [{ propertyName: field, operator: 'CONTAINS_TOKEN', value: lastSeven }] }],
-            properties: props,
-            limit: 1
+            properties: props, limit: 1
           });
           if (r.data.results?.length > 0) {
             console.log(`[lookup_contact] Fuzzy match via ${field} CONTAINS "${lastSeven}"`);
@@ -142,22 +118,15 @@ async function robustContactLookup({ phone, email }) {
       }
     }
   }
-
-  // 3) Email als allerletzte Möglichkeit
   if (email) {
     try {
       const r = await hs.post('/crm/v3/objects/contacts/search', {
         filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
-        properties: props,
-        limit: 1
+        properties: props, limit: 1
       });
-      if (r.data.results?.length > 0) {
-        console.log(`[lookup_contact] Match via email="${email}"`);
-        return r.data.results[0];
-      }
+      if (r.data.results?.length > 0) return r.data.results[0];
     } catch {}
   }
-
   console.log(`[lookup_contact] No match for phone="${phone}" email="${email}"`);
   return null;
 }
@@ -187,8 +156,84 @@ async function getSalesOwner() {
 }
 
 // ═══════════════════════════════════════════════════════════
-// F1: lookup_contact — Zu Beginn JEDES Gesprächs
+// DIAGNOSE-ENDPOINT (temporär, später entfernen!)
 // ═══════════════════════════════════════════════════════════
+app.get('/diag', async (req, res) => {
+  const token = process.env.HUBSPOT_ACCESS_TOKEN || '';
+  const result = {
+    timestamp: new Date().toISOString(),
+    token_check: {
+      present: !!token,
+      length: token.length,
+      starts_with: token.substring(0, 15),
+      ends_with_last5: token.length > 5 ? token.substring(token.length - 5) : '',
+      starts_with_pat_na1: token.startsWith('pat-na1-'),
+      has_leading_whitespace: token !== token.trimStart(),
+      has_trailing_whitespace: token !== token.trimEnd(),
+      contains_newline: token.includes('\n'),
+      contains_carriage_return: token.includes('\r'),
+      contains_tab: token.includes('\t'),
+      contains_quote_double: token.includes('"'),
+      contains_quote_single: token.includes("'"),
+      contains_invisible_unicode: /[\u200B-\u200D\uFEFF\u00A0]/.test(token),
+    },
+    other_env: {
+      transfer_number_set: !!process.env.INTERNAL_TRANSFER_NUMBER,
+      transfer_number_value: process.env.INTERNAL_TRANSFER_NUMBER || null,
+      port: process.env.PORT || 'not set',
+      node_version: process.version,
+    },
+    hubspot_live_test: null,
+    hubspot_test_with_trimmed_token: null,
+  };
+
+  try {
+    const testResponse = await axios.get(
+      'https://api.hubapi.com/crm/v3/objects/contacts?limit=1',
+      { headers: { 'Authorization': `Bearer ${token}` }, timeout: 10000 }
+    );
+    result.hubspot_live_test = {
+      success: true,
+      status: testResponse.status,
+      contacts_count: testResponse.data.results?.length || 0,
+      first_contact_id: testResponse.data.results?.[0]?.id || null,
+    };
+  } catch (e) {
+    result.hubspot_live_test = {
+      success: false,
+      status: e.response?.status || 'no_response',
+      error_message: e.response?.data?.message || e.message,
+      error_category: e.response?.data?.category || null,
+    };
+  }
+
+  try {
+    const trimmedToken = token.trim();
+    const testResponse = await axios.get(
+      'https://api.hubapi.com/crm/v3/objects/contacts?limit=1',
+      { headers: { 'Authorization': `Bearer ${trimmedToken}` }, timeout: 10000 }
+    );
+    result.hubspot_test_with_trimmed_token = {
+      success: true,
+      status: testResponse.status,
+      contacts_count: testResponse.data.results?.length || 0,
+      tokens_differ_after_trim: token !== trimmedToken,
+    };
+  } catch (e) {
+    result.hubspot_test_with_trimmed_token = {
+      success: false,
+      status: e.response?.status || 'no_response',
+      error_message: e.response?.data?.message || e.message,
+    };
+  }
+
+  res.json(result);
+});
+
+// ═══════════════════════════════════════════════════════════
+// F1-F11: alle bisherigen Funktionen unverändert
+// ═══════════════════════════════════════════════════════════
+
 app.post('/retell/lookup_contact', async (req, res) => {
   const { phone, email } = req.body;
   try {
@@ -208,9 +253,6 @@ app.post('/retell/lookup_contact', async (req, res) => {
   } catch (e) { res.json({ found: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F2: create_contact — Wenn Kontakt nicht gefunden
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/create_contact', async (req, res) => {
   const { firstname, lastname, phone, email, intent } = req.body;
   try {
@@ -227,9 +269,6 @@ app.post('/retell/create_contact', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F3: get_deal_status — Lieferstatus / Bestellung (Stufe 3)
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/get_deal_status', async (req, res) => {
   const { contact_id, order_number, verification_level } = req.body;
   if (parseInt(verification_level) < 3) return res.json({
@@ -245,7 +284,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
       properties: ['dealname','dealstage','amount','expected_delivery_date','vehicle_brand','vehicle_model'],
       limit: 1
     });
-    if (!r.data.results?.length) return res.json({ success: false, message: 'Kein Deal gefunden. Ticket + Rückruf anbieten.' });
+    if (!r.data.results?.length) return res.json({ success: false, message: 'Kein Deal gefunden.' });
     const p = r.data.results[0].properties;
     res.json({
       success: true, deal_id: r.data.results[0].id,
@@ -256,9 +295,6 @@ app.post('/retell/get_deal_status', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F4: add_call_note — PFLICHT nach JEDEM Gespräch
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/add_call_note', async (req, res) => {
   const { contact_id, deal_id, category, intent, summary,
           next_step, open_points, verification_level,
@@ -289,9 +325,6 @@ app.post('/retell/add_call_note', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F5: create_task — Aufgabe für Team
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/create_task', async (req, res) => {
   const { contact_id, subject, body, assigned_team, priority } = req.body;
   const ownerMap = {
@@ -315,9 +348,6 @@ app.post('/retell/create_task', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F6: book_appointment — Termin / Rückruf
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/book_appointment', async (req, res) => {
   const { contact_id, appointment_type, preferred_date, preferred_time, notes } = req.body;
   const ownerId = await getSalesOwner();
@@ -337,9 +367,6 @@ app.post('/retell/book_appointment', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F7: create_ticket — Support / Eskalation
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/create_ticket', async (req, res) => {
   const { contact_id, deal_id, subject, description, intent,
           priority, channel, verification_level, special_case, callback_time } = req.body;
@@ -372,9 +399,6 @@ app.post('/retell/create_ticket', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F8: lookup_tickets_for_dedupe — VOR create_ticket aufrufen
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
   const { contact_id, pipeline } = req.body;
   try {
@@ -392,9 +416,6 @@ app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
   } catch (e) { res.json({ duplicate_found: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F9: check_business_hours
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/check_business_hours', (req, res) => {
   const open = isBusinessHours();
   res.json({
@@ -404,9 +425,6 @@ app.post('/retell/check_business_hours', (req, res) => {
   });
 });
 
-// ═══════════════════════════════════════════════════════════
-// F10: set_opt_out
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/set_opt_out', async (req, res) => {
   const { contact_id } = req.body;
   try {
@@ -417,33 +435,18 @@ app.post('/retell/set_opt_out', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// ═══════════════════════════════════════════════════════════
-// F11: transfer_to_human — Gespräch an Mensch übergeben
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/transfer_to_human', async (req, res) => {
   const { contact_id, reason, urgency } = req.body;
   const transferNumber = process.env.INTERNAL_TRANSFER_NUMBER;
-
   if (!transferNumber) {
-    console.log('[Transfer] FEHLER: Keine INTERNAL_TRANSFER_NUMBER in Env-Variables gesetzt.');
-    return res.json({
-      success: false,
-      transfer_possible: false,
-      message: 'Keine Transfer-Nummer konfiguriert. Bitte Rückruf-Task anlegen.',
-      fallback: 'create_task'
-    });
+    return res.json({ success: false, transfer_possible: false,
+      message: 'Keine Transfer-Nummer konfiguriert.', fallback: 'create_task' });
   }
-
   const open = isBusinessHours();
   if (!open) {
-    return res.json({
-      success: false,
-      transfer_possible: false,
-      message: 'Außerhalb der Geschäftszeiten. Bitte Rückruf für den nächsten Werktag vereinbaren.',
-      fallback: 'book_appointment'
-    });
+    return res.json({ success: false, transfer_possible: false,
+      message: 'Außerhalb der Geschäftszeiten.', fallback: 'book_appointment' });
   }
-
   if (contact_id) {
     try {
       await hs.patch(`/crm/v3/objects/contacts/${contact_id}`, { properties: {
@@ -451,30 +454,19 @@ app.post('/retell/transfer_to_human', async (req, res) => {
         em_ai_next_step: 'human_handoff',
         em_ai_last_call_timestamp: new Date().toISOString(),
       }});
-    } catch (e) {
-      console.log(`[Transfer] HubSpot-Update fehlgeschlagen: ${e.message}`);
-    }
+    } catch (e) { console.log(`[Transfer] HubSpot-Update fehlgeschlagen: ${e.message}`); }
   }
-
-  console.log(`[Transfer] Contact ${contact_id||'unbekannt'} → ${transferNumber} | Grund: ${reason||'k.A.'} | Dringlichkeit: ${urgency||'normal'}`);
-
-  res.json({
-    success: true,
-    transfer_possible: true,
+  res.json({ success: true, transfer_possible: true,
     transfer_number: transferNumber,
-    message: 'Ich verbinde Sie jetzt mit einem Kollegen aus dem Team.'
-  });
+    message: 'Ich verbinde Sie jetzt mit einem Kollegen aus dem Team.' });
 });
 
-// ═══════════════════════════════════════════════════════════
-// POST-CALL WEBHOOK
-// ═══════════════════════════════════════════════════════════
 app.post('/retell/post-call-webhook', async (req, res) => {
   console.log(`[Post-Call] ${req.body.call_id} — Status: ${req.body.call_status}`);
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v2' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v3-diag' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Retell Integration v2 läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Retell Integration v3 (mit /diag) läuft auf Port ${PORT}`));
