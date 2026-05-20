@@ -270,11 +270,82 @@ app.post('/retell/create_contact', async (req, res) => {
 });
 
 app.post('/retell/get_deal_status', async (req, res) => {
-  const { contact_id, order_number, verification_level } = req.body;
+  const { contact_id, order_number, verification_level, vehicle_brand, vehicle_model, firstname, lastname } = req.body;
+
   if (parseInt(verification_level) < 3) return res.json({
     success: false,
-    message: 'Verifikationsstufe 3 erforderlich. Ordernummer + Name erfragen.'
+    reason: 'verification_required',
+    message: 'Verifikationsstufe 3 erforderlich.'
   });
+
+  const hasOrderNumber = !!(order_number && String(order_number).trim());
+  const hasBrandModel  = !!(vehicle_brand && vehicle_model && contact_id);
+
+  if (!hasOrderNumber && !hasBrandModel) return res.json({
+    success: false,
+    reason: 'missing_search_criteria',
+    message: 'Weder Ordernummer noch Hersteller+Modell+Contact-ID übermittelt.'
+  });
+
+  try {
+    const filters = [];
+    if (hasOrderNumber) {
+      filters.push({ propertyName: 'dealname', operator: 'CONTAINS_TOKEN', value: String(order_number).trim() });
+    } else {
+      filters.push({ propertyName: 'vehicle_brand', operator: 'CONTAINS_TOKEN', value: vehicle_brand });
+      filters.push({ propertyName: 'vehicle_model', operator: 'CONTAINS_TOKEN', value: vehicle_model });
+    }
+    if (contact_id) filters.push({ propertyName: 'associations.contact', operator: 'EQ', value: contact_id });
+
+    const r = await hs.post('/crm/v3/objects/deals/search', {
+      filterGroups: [{ filters }],
+      properties: ['dealname','dealstage','amount','expected_delivery_date','vehicle_brand','vehicle_model'],
+      limit: 5
+    });
+
+    if (!r.data.results?.length) return res.json({
+      success: false,
+      reason: 'no_match',
+      searched_by: hasOrderNumber ? 'order_number' : 'brand_model',
+      message: hasOrderNumber
+        ? 'Zu der genannten Ordernummer wurde kein Deal gefunden. Eventuell falsch verstanden oder noch nicht erfasst.'
+        : 'Zu Hersteller und Modell wurde kein Deal gefunden.'
+    });
+
+    if (r.data.results.length === 1) {
+      const p = r.data.results[0].properties;
+      return res.json({
+        success: true,
+        deal_id: r.data.results[0].id,
+        dealname: p.dealname || '',
+        stage: p.dealstage || '',
+        vehicle: `${p.vehicle_brand||''} ${p.vehicle_model||''}`.trim(),
+        expected_delivery: p.expected_delivery_date || 'Noch nicht bestätigt',
+      });
+    }
+
+    return res.json({
+      success: true,
+      multiple_matches: true,
+      count: r.data.results.length,
+      message: `${r.data.results.length} mögliche Treffer. Frage nach weiteren Details (z.B. Bestelldatum, exakter Modellname).`,
+      deals: r.data.results.map(d => ({
+        deal_id: d.id,
+        dealname: d.properties.dealname || '',
+        vehicle: `${d.properties.vehicle_brand||''} ${d.properties.vehicle_model||''}`.trim(),
+        stage: d.properties.dealstage || '',
+      }))
+    });
+  } catch (e) {
+    console.log(`[get_deal_status] Fehler: ${e.response?.status} ${e.response?.data?.message || e.message}`);
+    res.json({
+      success: false,
+      reason: 'hubspot_error',
+      message: 'Fehler bei der HubSpot-Abfrage.',
+      error: e.response?.data?.message || e.message
+    });
+  }
+});
   try {
     const filters = [];
     if (order_number) filters.push({ propertyName: 'dealname', operator: 'CONTAINS_TOKEN', value: order_number });
