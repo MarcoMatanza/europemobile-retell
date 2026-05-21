@@ -1,7 +1,7 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
  * EUROPEMOBILE × RETELL AI — HUBSPOT CUSTOM FUNCTIONS
- * Version: v3 — Diagnose-Build mit /diag Endpoint
+ * Version: v4 — Mittagspause, Zeitzonen-Support, Clean Rebuild
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -42,7 +42,13 @@ const CONFIG = {
     BUCHHALTUNG:    '69995518',
     ZULASSUNG:      '78387480',
   },
-  BUSINESS_HOURS: { start: 8.5, end: 17, days: [1,2,3,4,5] },
+  BUSINESS_HOURS: {
+    morningStart: 8.5,
+    morningEnd: 12,
+    afternoonStart: 13,
+    afternoonEnd: 17,
+    days: [1,2,3,4,5]
+  },
 };
 
 function normalizePhone(phone) {
@@ -135,9 +141,13 @@ function isBusinessHours() {
   const now = new Date();
   const day = now.getDay();
   const hour = now.getHours() + now.getMinutes() / 60;
-  return CONFIG.BUSINESS_HOURS.days.includes(day) &&
-    hour >= CONFIG.BUSINESS_HOURS.start &&
-    hour < CONFIG.BUSINESS_HOURS.end;
+  const bh = CONFIG.BUSINESS_HOURS;
+  if (!bh.days.includes(day)) return { open: false, reason: 'weekend_or_holiday' };
+  if (hour < bh.morningStart) return { open: false, reason: 'before_open' };
+  if (hour >= bh.morningStart && hour < bh.morningEnd) return { open: true, reason: 'morning' };
+  if (hour >= bh.morningEnd && hour < bh.afternoonStart) return { open: false, reason: 'lunch_break' };
+  if (hour >= bh.afternoonStart && hour < bh.afternoonEnd) return { open: true, reason: 'afternoon' };
+  return { open: false, reason: 'after_close' };
 }
 
 async function getSalesOwner() {
@@ -162,20 +172,14 @@ app.get('/diag', async (req, res) => {
   const token = process.env.HUBSPOT_ACCESS_TOKEN || '';
   const result = {
     timestamp: new Date().toISOString(),
+    server_time_local: new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' }),
+    timezone_env: process.env.TZ || 'not set',
+    business_hours_check: isBusinessHours(),
     token_check: {
       present: !!token,
       length: token.length,
       starts_with: token.substring(0, 15),
-      ends_with_last5: token.length > 5 ? token.substring(token.length - 5) : '',
       starts_with_pat_na1: token.startsWith('pat-na1-'),
-      has_leading_whitespace: token !== token.trimStart(),
-      has_trailing_whitespace: token !== token.trimEnd(),
-      contains_newline: token.includes('\n'),
-      contains_carriage_return: token.includes('\r'),
-      contains_tab: token.includes('\t'),
-      contains_quote_double: token.includes('"'),
-      contains_quote_single: token.includes("'"),
-      contains_invisible_unicode: /[\u200B-\u200D\uFEFF\u00A0]/.test(token),
     },
     other_env: {
       transfer_number_set: !!process.env.INTERNAL_TRANSFER_NUMBER,
@@ -184,7 +188,6 @@ app.get('/diag', async (req, res) => {
       node_version: process.version,
     },
     hubspot_live_test: null,
-    hubspot_test_with_trimmed_token: null,
   };
 
   try {
@@ -196,31 +199,9 @@ app.get('/diag', async (req, res) => {
       success: true,
       status: testResponse.status,
       contacts_count: testResponse.data.results?.length || 0,
-      first_contact_id: testResponse.data.results?.[0]?.id || null,
     };
   } catch (e) {
     result.hubspot_live_test = {
-      success: false,
-      status: e.response?.status || 'no_response',
-      error_message: e.response?.data?.message || e.message,
-      error_category: e.response?.data?.category || null,
-    };
-  }
-
-  try {
-    const trimmedToken = token.trim();
-    const testResponse = await axios.get(
-      'https://api.hubapi.com/crm/v3/objects/contacts?limit=1',
-      { headers: { 'Authorization': `Bearer ${trimmedToken}` }, timeout: 10000 }
-    );
-    result.hubspot_test_with_trimmed_token = {
-      success: true,
-      status: testResponse.status,
-      contacts_count: testResponse.data.results?.length || 0,
-      tokens_differ_after_trim: token !== trimmedToken,
-    };
-  } catch (e) {
-    result.hubspot_test_with_trimmed_token = {
       success: false,
       status: e.response?.status || 'no_response',
       error_message: e.response?.data?.message || e.message,
@@ -231,7 +212,7 @@ app.get('/diag', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// F1-F11: alle bisherigen Funktionen unverändert
+// Custom Functions F1-F11
 // ═══════════════════════════════════════════════════════════
 
 app.post('/retell/lookup_contact', async (req, res) => {
@@ -270,7 +251,7 @@ app.post('/retell/create_contact', async (req, res) => {
 });
 
 app.post('/retell/get_deal_status', async (req, res) => {
-  const { contact_id, order_number, verification_level, vehicle_brand, vehicle_model, firstname, lastname } = req.body;
+  const { contact_id, order_number, verification_level, vehicle_brand, vehicle_model } = req.body;
 
   if (parseInt(verification_level) < 3) return res.json({
     success: false,
@@ -308,7 +289,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
       reason: 'no_match',
       searched_by: hasOrderNumber ? 'order_number' : 'brand_model',
       message: hasOrderNumber
-        ? 'Zu der genannten Ordernummer wurde kein Deal gefunden. Eventuell falsch verstanden oder noch nicht erfasst.'
+        ? 'Zu der genannten Ordernummer wurde kein Deal gefunden.'
         : 'Zu Hersteller und Modell wurde kein Deal gefunden.'
     });
 
@@ -328,7 +309,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
       success: true,
       multiple_matches: true,
       count: r.data.results.length,
-      message: `${r.data.results.length} mögliche Treffer. Frage nach weiteren Details (z.B. Bestelldatum, exakter Modellname).`,
+      message: `${r.data.results.length} mögliche Treffer.`,
       deals: r.data.results.map(d => ({
         deal_id: d.id,
         dealname: d.properties.dealname || '',
@@ -346,32 +327,13 @@ app.post('/retell/get_deal_status', async (req, res) => {
     });
   }
 });
-  try {
-    const filters = [];
-    if (order_number) filters.push({ propertyName: 'dealname', operator: 'CONTAINS_TOKEN', value: order_number });
-    if (contact_id) filters.push({ propertyName: 'associations.contact', operator: 'EQ', value: contact_id });
-    const r = await hs.post('/crm/v3/objects/deals/search', {
-      filterGroups: [{ filters }],
-      properties: ['dealname','dealstage','amount','expected_delivery_date','vehicle_brand','vehicle_model'],
-      limit: 1
-    });
-    if (!r.data.results?.length) return res.json({ success: false, message: 'Kein Deal gefunden.' });
-    const p = r.data.results[0].properties;
-    res.json({
-      success: true, deal_id: r.data.results[0].id,
-      dealname: p.dealname, stage: p.dealstage,
-      vehicle: `${p.vehicle_brand||''} ${p.vehicle_model||''}`.trim(),
-      expected_delivery: p.expected_delivery_date || 'Noch nicht bestätigt',
-    });
-  } catch (e) { res.json({ success: false, error: e.message }); }
-});
 
 app.post('/retell/add_call_note', async (req, res) => {
   const { contact_id, deal_id, category, intent, summary,
           next_step, open_points, verification_level,
           channel, special_case, callback_time } = req.body;
   const body = [
-    `[KI-Notiz ${new Date().toLocaleString('de-DE')}]`,
+    `[KI-Notiz ${new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' })}]`,
     `Kanal: ${channel||'PHONE'} | Kategorie: ${category||'SALES'} | Intent: ${intent||''}`,
     `Verifikation: Stufe ${verification_level||1}`,
     `\nZusammenfassung:\n${summary||''}`,
@@ -488,11 +450,20 @@ app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
 });
 
 app.post('/retell/check_business_hours', (req, res) => {
-  const open = isBusinessHours();
+  const status = isBusinessHours();
+  const messages = {
+    morning: 'Geschäftszeiten aktiv (vormittags) — Transfer möglich.',
+    afternoon: 'Geschäftszeiten aktiv (nachmittags) — Transfer möglich.',
+    lunch_break: 'Mittagspause 12:00-13:00 Uhr — kein Transfer, Rückruf nach 13:00 anbieten.',
+    before_open: 'Vor Öffnung (vor 8:30) — Rückruf für später am Tag anbieten.',
+    after_close: 'Nach Geschäftsschluss (nach 17:00) — Rückruf für nächsten Werktag anbieten.',
+    weekend_or_holiday: 'Wochenende oder Feiertag — Rückruf für nächsten Werktag anbieten.',
+  };
   res.json({
-    is_open: open,
-    message: open ? 'Geschäftszeiten aktiv — Transfer möglich.' : 'Außerhalb GZ — Rückruf anbieten.',
-    recommendation: open ? 'transfer_to_human aufrufen' : 'create_task + book_appointment'
+    is_open: status.open,
+    reason: status.reason,
+    message: messages[status.reason] || 'Status unbekannt.',
+    recommendation: status.open ? 'transfer_to_human aufrufen' : 'book_appointment oder create_task'
   });
 });
 
@@ -513,10 +484,21 @@ app.post('/retell/transfer_to_human', async (req, res) => {
     return res.json({ success: false, transfer_possible: false,
       message: 'Keine Transfer-Nummer konfiguriert.', fallback: 'create_task' });
   }
-  const open = isBusinessHours();
-  if (!open) {
-    return res.json({ success: false, transfer_possible: false,
-      message: 'Außerhalb der Geschäftszeiten.', fallback: 'book_appointment' });
+  const status = isBusinessHours();
+  if (!status.open) {
+    const reasonMessages = {
+      lunch_break: 'Mittagspause bis 13:00 Uhr — Transfer aktuell nicht möglich.',
+      before_open: 'Vor Geschäftsöffnung — Transfer aktuell nicht möglich.',
+      after_close: 'Nach Geschäftsschluss — Transfer aktuell nicht möglich.',
+      weekend_or_holiday: 'Wochenende oder Feiertag — Transfer aktuell nicht möglich.',
+    };
+    return res.json({
+      success: false,
+      transfer_possible: false,
+      reason: status.reason,
+      message: reasonMessages[status.reason] || 'Außerhalb der Geschäftszeiten.',
+      fallback: 'book_appointment'
+    });
   }
   if (contact_id) {
     try {
@@ -537,7 +519,7 @@ app.post('/retell/post-call-webhook', async (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v3-diag' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Retell Integration v3 (mit /diag) läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Retell Integration v4 läuft auf Port ${PORT}`));
