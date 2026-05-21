@@ -1,7 +1,8 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
  * EUROPEMOBILE × RETELL AI — HUBSPOT CUSTOM FUNCTIONS
- * Version: v4 — Mittagspause, Zeitzonen-Support, Clean Rebuild
+ * Version: v4.1 — Inzahlungnahme-Intent ergänzt
+ * Basis: v4 (Mittagspause, Zeitzonen-Support, Clean Rebuild)
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -215,6 +216,7 @@ app.get('/diag', async (req, res) => {
 // Custom Functions F1-F11
 // ═══════════════════════════════════════════════════════════
 
+// F1: lookup_contact
 app.post('/retell/lookup_contact', async (req, res) => {
   const { phone, email } = req.body;
   try {
@@ -234,6 +236,7 @@ app.post('/retell/lookup_contact', async (req, res) => {
   } catch (e) { res.json({ found: false, error: e.message }); }
 });
 
+// F2: create_contact
 app.post('/retell/create_contact', async (req, res) => {
   const { firstname, lastname, phone, email, intent } = req.body;
   try {
@@ -250,6 +253,7 @@ app.post('/retell/create_contact', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
+// F3: get_deal_status
 app.post('/retell/get_deal_status', async (req, res) => {
   const { contact_id, order_number, verification_level, vehicle_brand, vehicle_model } = req.body;
 
@@ -328,6 +332,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
   }
 });
 
+// F4: add_call_note
 app.post('/retell/add_call_note', async (req, res) => {
   const { contact_id, deal_id, category, intent, summary,
           next_step, open_points, verification_level,
@@ -358,6 +363,7 @@ app.post('/retell/add_call_note', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
+// F5: create_task
 app.post('/retell/create_task', async (req, res) => {
   const { contact_id, subject, body, assigned_team, priority } = req.body;
   const ownerMap = {
@@ -381,6 +387,7 @@ app.post('/retell/create_task', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
+// F6: book_appointment
 app.post('/retell/book_appointment', async (req, res) => {
   const { contact_id, appointment_type, preferred_date, preferred_time, notes } = req.body;
   const ownerId = await getSalesOwner();
@@ -400,6 +407,9 @@ app.post('/retell/book_appointment', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════
+// F7: create_ticket — Support / Eskalation
+// ═══════════════════════════════════════════════════════════
 app.post('/retell/create_ticket', async (req, res) => {
   const { contact_id, deal_id, subject, description, intent,
           priority, channel, verification_level, special_case, callback_time } = req.body;
@@ -414,6 +424,7 @@ app.post('/retell/create_ticket', async (req, res) => {
     reklamation: { pl: CONFIG.PIPELINES.support, owner: CONFIG.OWNERS.HELPDESK },
     anwalt: { pl: CONFIG.PIPELINES.support, owner: CONFIG.OWNERS.HELPDESK },
     lead: { pl: CONFIG.PIPELINES.lead_abwicklung, owner: await getSalesOwner() },
+    inzahlungnahme: { pl: CONFIG.PIPELINES.lead_abwicklung, owner: await getSalesOwner() },
   };
   const r = intentMap[intent?.toLowerCase()] || { pl: CONFIG.PIPELINES.support, owner: CONFIG.OWNERS.HELPDESK };
   const body = `${description||''}\n\nKanal: ${channel||'PHONE'} | Stufe: ${verification_level||1} | ${callback_time?'Rückruf: '+callback_time:''} | ${special_case?'⚠ SONDERFALL':''}`.trim();
@@ -432,6 +443,9 @@ app.post('/retell/create_ticket', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════
+// F8: lookup_tickets_for_dedupe — VOR create_ticket aufrufen
+// ═══════════════════════════════════════════════════════════
 app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
   const { contact_id, pipeline } = req.body;
   try {
@@ -449,6 +463,7 @@ app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
   } catch (e) { res.json({ duplicate_found: false, error: e.message }); }
 });
 
+// F9: check_business_hours
 app.post('/retell/check_business_hours', (req, res) => {
   const status = isBusinessHours();
   const messages = {
@@ -467,6 +482,7 @@ app.post('/retell/check_business_hours', (req, res) => {
   });
 });
 
+// F10: set_opt_out
 app.post('/retell/set_opt_out', async (req, res) => {
   const { contact_id } = req.body;
   try {
@@ -477,6 +493,7 @@ app.post('/retell/set_opt_out', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
+// F11: transfer_to_human
 app.post('/retell/transfer_to_human', async (req, res) => {
   const { contact_id, reason, urgency } = req.body;
   const transferNumber = process.env.INTERNAL_TRANSFER_NUMBER;
@@ -514,12 +531,13 @@ app.post('/retell/transfer_to_human', async (req, res) => {
     message: 'Ich verbinde Sie jetzt mit einem Kollegen aus dem Team.' });
 });
 
+// Post-Call-Webhook
 app.post('/retell/post-call-webhook', async (req, res) => {
   console.log(`[Post-Call] ${req.body.call_id} — Status: ${req.body.call_status}`);
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4.1' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Retell Integration v4 läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Retell Integration v4.1 läuft auf Port ${PORT}`));
