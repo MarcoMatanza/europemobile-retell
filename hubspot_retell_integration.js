@@ -1,14 +1,19 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
  * EUROPEMOBILE × RETELL AI — HUBSPOT CUSTOM FUNCTIONS
- * Version: v4.2 — Hardening: lookup_tickets_for_dedupe + get_deal_status
- * Basis: v4.1 (Inzahlungnahme-Intent)
- * 
- * CHANGES gegenüber v4.1:
- * - lookup_tickets_for_dedupe: Pflichtfeld-Validierung, kein 400 mehr
- * - lookup_tickets_for_dedupe: status-Filter clientseitig statt serverseitig
- * - get_deal_status: Retry ohne contact_id-Filter falls HubSpot 400 wirft
- * - Alle Tool-Errors liefern ab jetzt actionable JSON statt nackten Errors
+ * Version: v4.3 — Hardening: Dummy-Phone-/Email-Filter in lookup_contact
+ * Basis: v4.2 (Hardening lookup_tickets_for_dedupe + get_deal_status)
+ *
+ * CHANGES gegenüber v4.2:
+ * - NEU: isDummyPhone() — zentraler Dummy-Detektor (leer, <8 Ziffern,
+ *        nur Nullen, gleiche Ziffern, bekannte Patterns wie +490000000000)
+ * - NEU: isDummyEmail() — Dummy-Detektor für Emails
+ * - buildPhoneVariants: nutzt isDummyPhone() und gibt [] zurück
+ * - robustContactLookup: Fuzzy-Match-Block ebenfalls über isDummyPhone()
+ *   geschützt; Email-Fallback über isDummyEmail()
+ * - lookup_contact: Frühe Validierung, kein HubSpot-Call mehr bei reinen
+ *   Dummy-Inputs (spart Latenz und verhindert Geister-Matches)
+ * - Bessere Logs zur Diagnose im Railway-Log
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -58,6 +63,58 @@ const CONFIG = {
   },
 };
 
+// ═══════════════════════════════════════════════════════════
+// NEU v4.3 — Dummy-Detektoren
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Erkennt Dummy-Telefonnummern, die in Test-/Default-Szenarien auftreten.
+ * Schützt vor unbeabsichtigtem Match in HubSpot, wenn dort Kontakte mit
+ * Default-Werten (z.B. +490000000000) gepflegt sind.
+ */
+function isDummyPhone(input) {
+  if (!input) return true;
+  const digitsOnly = String(input).replace(/[^0-9]/g, '');
+  if (digitsOnly.length < 8) return true;                  // zu kurz
+  if (/^0+$/.test(digitsOnly)) return true;                // nur Nullen
+  if (/^([0-9])\1{6,}$/.test(digitsOnly)) return true;     // 7+ gleiche Ziffern
+  const knownDummies = new Set([
+    '490000000000',
+    '491234567890',
+    '4900000000',
+    '00000000000',
+    '12345678',
+    '1234567890',
+    '0000000000',
+  ]);
+  if (knownDummies.has(digitsOnly)) return true;
+  // Sequenzielle Test-Patterns (z.B. "123456789")
+  if (/^0?123456789/.test(digitsOnly)) return true;
+  return false;
+}
+
+/**
+ * Erkennt offensichtliche Dummy-Emails.
+ */
+function isDummyEmail(input) {
+  if (!input) return true;
+  const e = String(input).trim().toLowerCase();
+  if (e.length < 5) return true;
+  if (!e.includes('@')) return true;
+  if (!e.includes('.')) return true;
+  const knownDummies = new Set([
+    'test@test.com',
+    'test@test.de',
+    'noreply@example.com',
+    'a@a.com',
+    'a@a.de',
+    'user@example.com',
+    'demo@demo.com',
+  ]);
+  if (knownDummies.has(e)) return true;
+  return false;
+}
+
 function normalizePhone(phone) {
   if (!phone) return '';
   let n = String(phone).replace(/[\s\-\(\)\.]/g, '');
@@ -67,7 +124,11 @@ function normalizePhone(phone) {
 }
 
 function buildPhoneVariants(input) {
-  if (!input) return [];
+  // v4.3: Dummy-Filter VOR jeder Verarbeitung
+  if (isDummyPhone(input)) {
+    console.log(`[buildPhoneVariants] Dummy oder ungültig: "${input}" — übersprungen`);
+    return [];
+  }
   const clean = String(input).replace(/[\s\-\(\)\.\/]/g, '');
   let e164;
   if (clean.startsWith('+'))         e164 = clean;
@@ -94,52 +155,82 @@ function buildPhoneVariants(input) {
 }
 
 async function robustContactLookup({ phone, email }) {
-  const variants = buildPhoneVariants(phone);
-  const props = ['firstname','lastname','email','phone','mobilephone',
-                 'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'];
-  for (const variant of variants) {
-    for (const field of ['phone', 'mobilephone']) {
-      try {
-        const r = await hs.post('/crm/v3/objects/contacts/search', {
-          filterGroups: [{ filters: [{ propertyName: field, operator: 'EQ', value: variant }] }],
-          properties: props, limit: 1
-        });
-        if (r.data.results?.length > 0) {
-          console.log(`[lookup_contact] Match via ${field}="${variant}"`);
-          return r.data.results[0];
-        }
-      } catch (e) {
-        console.log(`[lookup_contact] Search error ${field}="${variant}": ${e.message}`);
-      }
-    }
+  const phoneIsDummy = isDummyPhone(phone);
+  const emailIsDummy = isDummyEmail(email);
+
+  // v4.3: Wenn beides Dummy → früh raus, kein HubSpot-Call
+  if (phoneIsDummy && emailIsDummy) {
+    console.log(`[lookup_contact] Phone UND Email sind Dummy/leer — kein Lookup, return null`);
+    return null;
   }
-  if (phone) {
-    const digitsOnly = String(phone).replace(/[^0-9]/g, '');
-    if (digitsOnly.length >= 7) {
-      const lastSeven = digitsOnly.slice(-7);
+
+  // Phone-Suche nur wenn phone NICHT Dummy ist
+  if (!phoneIsDummy) {
+    const variants = buildPhoneVariants(phone);
+    const props = ['firstname','lastname','email','phone','mobilephone',
+                   'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'];
+    for (const variant of variants) {
       for (const field of ['phone', 'mobilephone']) {
         try {
           const r = await hs.post('/crm/v3/objects/contacts/search', {
-            filterGroups: [{ filters: [{ propertyName: field, operator: 'CONTAINS_TOKEN', value: lastSeven }] }],
+            filterGroups: [{ filters: [{ propertyName: field, operator: 'EQ', value: variant }] }],
             properties: props, limit: 1
           });
           if (r.data.results?.length > 0) {
-            console.log(`[lookup_contact] Fuzzy match via ${field} CONTAINS "${lastSeven}"`);
+            console.log(`[lookup_contact] Match via ${field}="${variant}"`);
             return r.data.results[0];
           }
-        } catch {}
+        } catch (e) {
+          console.log(`[lookup_contact] Search error ${field}="${variant}": ${e.message}`);
+        }
       }
     }
+    // Fuzzy-Match (letzte 7 Ziffern) — ebenfalls nur bei echter Nummer
+    const digitsOnly = String(phone).replace(/[^0-9]/g, '');
+    if (digitsOnly.length >= 8) {       // v4.3: Mindestlänge statt nur >=7
+      const lastSeven = digitsOnly.slice(-7);
+      // v4.3: Auch lastSeven gegen Dummy prüfen (z.B. "0000000")
+      if (!/^0+$/.test(lastSeven) && !/^([0-9])\1{5,}$/.test(lastSeven)) {
+        const props = ['firstname','lastname','email','phone','mobilephone',
+                       'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'];
+        for (const field of ['phone', 'mobilephone']) {
+          try {
+            const r = await hs.post('/crm/v3/objects/contacts/search', {
+              filterGroups: [{ filters: [{ propertyName: field, operator: 'CONTAINS_TOKEN', value: lastSeven }] }],
+              properties: props, limit: 1
+            });
+            if (r.data.results?.length > 0) {
+              console.log(`[lookup_contact] Fuzzy match via ${field} CONTAINS "${lastSeven}"`);
+              return r.data.results[0];
+            }
+          } catch {}
+        }
+      } else {
+        console.log(`[lookup_contact] Fuzzy-Match übersprungen — lastSeven="${lastSeven}" wirkt wie Dummy`);
+      }
+    }
+  } else if (phone) {
+    console.log(`[lookup_contact] Phone "${phone}" als Dummy klassifiziert — übersprungen`);
   }
-  if (email) {
+
+  // Email-Fallback nur bei echter Email
+  if (!emailIsDummy) {
     try {
       const r = await hs.post('/crm/v3/objects/contacts/search', {
         filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
-        properties: props, limit: 1
+        properties: ['firstname','lastname','email','phone','mobilephone',
+                     'hubspot_owner_id','em_ai_opt_out_ki_calls','em_ai_call_status'],
+        limit: 1
       });
-      if (r.data.results?.length > 0) return r.data.results[0];
+      if (r.data.results?.length > 0) {
+        console.log(`[lookup_contact] Match via email="${email}"`);
+        return r.data.results[0];
+      }
     } catch {}
+  } else if (email) {
+    console.log(`[lookup_contact] Email "${email}" als Dummy klassifiziert — übersprungen`);
   }
+
   console.log(`[lookup_contact] No match for phone="${phone}" email="${email}"`);
   return null;
 }
@@ -194,6 +285,14 @@ app.get('/diag', async (req, res) => {
       port: process.env.PORT || 'not set',
       node_version: process.version,
     },
+    dummy_filter_test: {
+      // v4.3: Diagnose-Test für Dummy-Filter
+      '+490000000000': isDummyPhone('+490000000000'),
+      '+491234567890': isDummyPhone('+491234567890'),
+      '+4917923404471': isDummyPhone('+4917923404471'),  // sollte false sein
+      '': isDummyPhone(''),
+      'null': isDummyPhone(null),
+    },
     hubspot_live_test: null,
   };
 
@@ -222,9 +321,20 @@ app.get('/diag', async (req, res) => {
 // Custom Functions F1-F11
 // ═══════════════════════════════════════════════════════════
 
-// F1: lookup_contact
+// F1: lookup_contact — v4.3 mit früher Dummy-Validierung
 app.post('/retell/lookup_contact', async (req, res) => {
   const { phone, email } = req.body;
+
+  // v4.3: Frühe Validierung — wenn beides Dummy/leer, sofort neutral antworten
+  if (isDummyPhone(phone) && isDummyEmail(email)) {
+    console.log(`[lookup_contact] BLOCKED — Dummy-Inputs: phone="${phone}" email="${email}"`);
+    return res.json({
+      found: false,
+      reason: 'invalid_input',
+      message: 'Neuer Interessent.'
+    });
+  }
+
   try {
     const contact = await robustContactLookup({ phone, email });
     if (!contact) return res.json({ found: false, message: 'Neuer Interessent.' });
@@ -473,9 +583,6 @@ app.post('/retell/create_ticket', async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════
 // F8: lookup_tickets_for_dedupe — HARDENED v4.2
-// - Pflichtfeld-Validierung VOR HubSpot-Call
-// - Status-Filter clientseitig (sicherer)
-// - Saubere actionable Antwort bei Fehlern
 // ═══════════════════════════════════════════════════════════
 app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
   const { contact_id, pipeline } = req.body;
@@ -604,7 +711,7 @@ app.post('/retell/post-call-webhook', async (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4.2' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4.3' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Retell Integration v4.2 läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Retell Integration v4.3 läuft auf Port ${PORT}`));
