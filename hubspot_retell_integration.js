@@ -1,8 +1,14 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
  * EUROPEMOBILE × RETELL AI — HUBSPOT CUSTOM FUNCTIONS
- * Version: v4.1 — Inzahlungnahme-Intent ergänzt
- * Basis: v4 (Mittagspause, Zeitzonen-Support, Clean Rebuild)
+ * Version: v4.2 — Hardening: lookup_tickets_for_dedupe + get_deal_status
+ * Basis: v4.1 (Inzahlungnahme-Intent)
+ * 
+ * CHANGES gegenüber v4.1:
+ * - lookup_tickets_for_dedupe: Pflichtfeld-Validierung, kein 400 mehr
+ * - lookup_tickets_for_dedupe: status-Filter clientseitig statt serverseitig
+ * - get_deal_status: Retry ohne contact_id-Filter falls HubSpot 400 wirft
+ * - Alle Tool-Errors liefern ab jetzt actionable JSON statt nackten Errors
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -253,7 +259,32 @@ app.post('/retell/create_contact', async (req, res) => {
   } catch (e) { res.json({ success: false, error: e.message }); }
 });
 
-// F3: get_deal_status
+// ═══════════════════════════════════════════════════════════
+// F3: get_deal_status — mit Retry-Logik bei 400-Fehlern (v4.2)
+// ═══════════════════════════════════════════════════════════
+async function searchDealsWithFallback(filters, baseProps) {
+  try {
+    return await hs.post('/crm/v3/objects/deals/search', {
+      filterGroups: [{ filters }],
+      properties: baseProps,
+      limit: 5
+    });
+  } catch (e) {
+    if (e.response?.status === 400) {
+      const fallbackFilters = filters.filter(f => f.propertyName !== 'associations.contact');
+      if (fallbackFilters.length > 0 && fallbackFilters.length < filters.length) {
+        console.log('[get_deal_status] Retry ohne associations.contact-Filter');
+        return await hs.post('/crm/v3/objects/deals/search', {
+          filterGroups: [{ filters: fallbackFilters }],
+          properties: baseProps,
+          limit: 5
+        });
+      }
+    }
+    throw e;
+  }
+}
+
 app.post('/retell/get_deal_status', async (req, res) => {
   const { contact_id, order_number, verification_level, vehicle_brand, vehicle_model } = req.body;
 
@@ -269,7 +300,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
   if (!hasOrderNumber && !hasBrandModel) return res.json({
     success: false,
     reason: 'missing_search_criteria',
-    message: 'Weder Ordernummer noch Hersteller+Modell+Contact-ID übermittelt.'
+    message: 'Weder Ordernummer noch Hersteller+Modell+Contact-ID übermittelt. Anrufer um Ordernummer bitten oder Marke und Modell erfragen.'
   });
 
   try {
@@ -280,21 +311,18 @@ app.post('/retell/get_deal_status', async (req, res) => {
       filters.push({ propertyName: 'vehicle_brand', operator: 'CONTAINS_TOKEN', value: vehicle_brand });
       filters.push({ propertyName: 'vehicle_model', operator: 'CONTAINS_TOKEN', value: vehicle_model });
     }
-    if (contact_id) filters.push({ propertyName: 'associations.contact', operator: 'EQ', value: contact_id });
+    if (contact_id) filters.push({ propertyName: 'associations.contact', operator: 'EQ', value: String(contact_id) });
 
-    const r = await hs.post('/crm/v3/objects/deals/search', {
-      filterGroups: [{ filters }],
-      properties: ['dealname','dealstage','amount','expected_delivery_date','vehicle_brand','vehicle_model'],
-      limit: 5
-    });
+    const props = ['dealname','dealstage','amount','expected_delivery_date','vehicle_brand','vehicle_model'];
+    const r = await searchDealsWithFallback(filters, props);
 
     if (!r.data.results?.length) return res.json({
       success: false,
       reason: 'no_match',
       searched_by: hasOrderNumber ? 'order_number' : 'brand_model',
       message: hasOrderNumber
-        ? 'Zu der genannten Ordernummer wurde kein Deal gefunden.'
-        : 'Zu Hersteller und Modell wurde kein Deal gefunden.'
+        ? 'Zu der genannten Ordernummer wurde kein Deal gefunden. Anrufer fragen, ob er die Nummer nochmal prüfen kann ODER ob ein Ticket angelegt werden soll, damit das Logistik-Team sich meldet.'
+        : 'Zu Hersteller und Modell wurde kein Deal gefunden. Anrufer fragen, ob ein Ticket angelegt werden soll.'
     });
 
     if (r.data.results.length === 1) {
@@ -313,7 +341,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
       success: true,
       multiple_matches: true,
       count: r.data.results.length,
-      message: `${r.data.results.length} mögliche Treffer.`,
+      message: `${r.data.results.length} mögliche Treffer. Anrufer um genauere Angaben bitten (z.B. Fahrzeugmarke).`,
       deals: r.data.results.map(d => ({
         deal_id: d.id,
         dealname: d.properties.dealname || '',
@@ -326,7 +354,7 @@ app.post('/retell/get_deal_status', async (req, res) => {
     res.json({
       success: false,
       reason: 'hubspot_error',
-      message: 'Fehler bei der HubSpot-Abfrage.',
+      message: 'Es gab ein technisches Problem beim Abfragen. Anrufer informieren, dass das Logistik-Team sich per Ticket meldet, und dann create_ticket aufrufen.',
       error: e.response?.data?.message || e.message
     });
   }
@@ -444,23 +472,62 @@ app.post('/retell/create_ticket', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// F8: lookup_tickets_for_dedupe — VOR create_ticket aufrufen
+// F8: lookup_tickets_for_dedupe — HARDENED v4.2
+// - Pflichtfeld-Validierung VOR HubSpot-Call
+// - Status-Filter clientseitig (sicherer)
+// - Saubere actionable Antwort bei Fehlern
 // ═══════════════════════════════════════════════════════════
 app.post('/retell/lookup_tickets_for_dedupe', async (req, res) => {
   const { contact_id, pipeline } = req.body;
+
+  if (!contact_id || !pipeline) {
+    return res.json({
+      duplicate_found: false,
+      reason: 'missing_params',
+      message: 'Dedupe-Check ohne contact_id oder pipeline nicht möglich. Direkt mit Ticket-Anlage fortfahren.'
+    });
+  }
+
   try {
     const r = await hs.post('/crm/v3/objects/tickets/search', {
       filterGroups: [{ filters: [
-        { propertyName: 'associations.contact', operator: 'EQ', value: contact_id },
-        { propertyName: 'hs_pipeline', operator: 'EQ', value: pipeline },
-        { propertyName: 'hs_ticket_status', operator: 'NEQ', value: 'CLOSED' },
+        { propertyName: 'associations.contact', operator: 'EQ', value: String(contact_id) },
+        { propertyName: 'hs_pipeline', operator: 'EQ', value: String(pipeline) },
       ]}],
-      properties: ['subject','hs_pipeline_stage','createdate'], limit: 3
+      properties: ['subject','hs_pipeline_stage','createdate','hs_ticket_status','hs_pipeline'],
+      limit: 5
     });
-    if (!r.data.results?.length) return res.json({ duplicate_found: false });
-    const t = r.data.results[0];
-    res.json({ duplicate_found: true, existing_ticket_id: t.id, subject: t.properties.subject });
-  } catch (e) { res.json({ duplicate_found: false, error: e.message }); }
+
+    if (!r.data.results?.length) {
+      return res.json({ duplicate_found: false });
+    }
+
+    const openTickets = r.data.results.filter(t => {
+      const status = (t.properties.hs_ticket_status || '').toUpperCase();
+      const stage = t.properties.hs_pipeline_stage || '';
+      return status !== 'CLOSED' && status !== '4' && stage !== '4';
+    });
+
+    if (!openTickets.length) {
+      return res.json({ duplicate_found: false });
+    }
+
+    const t = openTickets[0];
+    return res.json({
+      duplicate_found: true,
+      existing_ticket_id: t.id,
+      subject: t.properties.subject || '',
+      message: 'Es gibt bereits ein offenes Ticket zu diesem Thema. Anrufer freundlich darauf hinweisen und fragen, ob es zum bestehenden Vorgang gehört.'
+    });
+  } catch (e) {
+    console.log(`[lookup_tickets_for_dedupe] Fehler: ${e.response?.status} ${e.response?.data?.message || e.message}`);
+    return res.json({
+      duplicate_found: false,
+      reason: 'hubspot_error',
+      message: 'Dedupe-Check fehlgeschlagen. Trotzdem mit Ticket-Anlage fortfahren.',
+      error: e.response?.data?.message || e.message
+    });
+  }
 });
 
 // F9: check_business_hours
@@ -537,7 +604,7 @@ app.post('/retell/post-call-webhook', async (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4.1' }));
+app.get('/health', (req, res) => res.json({ status: 'ok', functions: 11, version: 'v4.2' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Retell Integration v4.1 läuft auf Port ${PORT}`));
+app.listen(PORT, () => console.log(`Retell Integration v4.2 läuft auf Port ${PORT}`));
